@@ -87,9 +87,10 @@ jobs:
 
       - name: 生成允许 CN 6GHz 的 regulatory.db
         run: |
-          # 用 GitHub 镜像，kernel.org 的 git 在 CI 上容易超时
-          git clone --depth 1 https://github.com/linux-wireless/wireless-regdb.git /tmp/regdb
+          # GitHub 镜像在 sforshee 名下；linux-wireless/wireless-regdb 不存在（404）
+          git clone --depth 1 https://github.com/sforshee/wireless-regdb.git /tmp/regdb
           cd /tmp/regdb
+          ls -1 db.txt db2fw.py 2>/dev/null || true
           python3 - "$GITHUB_WORKSPACE/db-cn-6ghz.txt" <<'PY'
           import re, sys, io
           patch_file = sys.argv[1]
@@ -105,18 +106,23 @@ jobs:
           io.open("db.txt", "w", encoding="utf-8", newline="\n").write(db2)
           print("CN 段已替换，含 6 GHz 条目")
           PY
-          # 上游把生成脚本从 db2fw.py 改名成了 db2bin.py，两个都试
-          if [ -f db2bin.py ]; then
-            echo "使用 db2bin.py"
-            python3 db2bin.py regulatory.db db.txt
-          elif [ -f db2fw.py ]; then
-            echo "使用 db2fw.py"
+          # db2fw.py 生成内核 4.15+ 需要的 regulatory.db。
+          # 不要用 db2bin.py —— 它生成的是老式 regulatory.bin，格式不同。
+          if [ -f db2fw.py ]; then
+            echo "== 用 db2fw.py 生成 regulatory.db"
             python3 db2fw.py regulatory.db db.txt
           else
-            echo "找不到生成脚本，改用 make"
+            echo "== 回退到 make"
             make regulatory.db
           fi
           ls -l regulatory.db
+          # 确认 6 GHz 真的写进去了
+          python3 - <<'PY'
+          import io
+          raw = io.open("regulatory.db", "rb").read()
+          print("regulatory.db size:", len(raw))
+          print("contains CN:", b"CN" in raw)
+          PY
           mkdir -p "$GITHUB_WORKSPACE/openwrt/files/lib/firmware"
           cp regulatory.db "$GITHUB_WORKSPACE/openwrt/files/lib/firmware/regulatory.db"
           echo "已放入镜像的 /lib/firmware/regulatory.db"
