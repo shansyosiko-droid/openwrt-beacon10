@@ -1,0 +1,161 @@
+# 在 GitHub Actions 上编译 Nokia Beacon 10 的 OpenWrt
+#
+# 用法：
+#   1. 在 GitHub 建一个空仓库，把这个文件放到 .github/workflows/build.yml
+#   2. 把 db-cn-6ghz.txt 也放进仓库根目录
+#   3. 进 Actions 页面，点 "Run workflow"
+#   4. 大约 60–90 分钟后，在 Artifacts 里下载 sysupgrade.bin
+#
+# 说明：编译机只有 14 GB 可用空间，OpenWrt 要 20 GB+，
+#       所以第一步必须先删掉 runner 预装的一堆大件。
+
+name: Build OpenWrt Beacon 10 (6GHz enabled)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_patch:
+        description: 'PR diff 地址'
+        required: false
+        default: 'https://github.com/openwrt/openwrt/pull/26129.diff'
+      target_branch:
+        description: 'OpenWrt 分支（main 或 openwrt-24.10）'
+        required: false
+        default: 'main'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /opt/microsoft /usr/share/swift
+          sudo docker image prune -a -f || true
+          df -h /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget qemu-utils \
+            ccache ecj fastjar java-propose-classpath libelf-dev libncursesw5-dev \
+            python3 python3-distutils python3-apt python3-docutils python3-pil \
+            python3-pip python3-venv python3-dev subversion device-tree-compiler
+
+      - name: 拉取 OpenWrt
+        run: |
+          git clone --depth 20 --branch ${{ inputs.target_branch }} \
+            https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          git log --oneline -1
+
+      - name: 打上 Beacon 10 支持（PR #26129）
+        run: |
+          cd openwrt
+          curl -fsSL "${{ inputs.pr_patch }}" -o /tmp/pr.diff
+          echo "--- diff 大小: $(wc -c < /tmp/pr.diff) 字节"
+          if git apply --check /tmp/pr.diff; then
+            git apply /tmp/pr.diff
+            echo "git apply 成功"
+          else
+            echo "git apply 失败，尝试 patch --fuzz"
+            patch -p1 --fuzz=3 < /tmp/pr.diff
+          fi
+          ls -l target/linux/qualcommbe/dts/ipq9574-nokia-beacon-10.dts
+
+      - name: 修补 ath11k-firmware 的 mirror hash
+        run: |
+          cd openwrt
+          f=package/firmware/ath11k-firmware/Makefile
+          if grep -qE '^PKG_MIRROR_HASH' "$f"; then
+            sed -i 's|^PKG_MIRROR_HASH.*|PKG_MIRROR_HASH:=skip|' "$f"
+            echo "已把 PKG_MIRROR_HASH 设为 skip"
+            grep -n 'PKG_MIRROR_HASH' "$f"
+          else
+            echo "没找到 PKG_MIRROR_HASH，跳过"
+          fi
+
+      - name: 生成允许 CN 6GHz 的 regulatory.db
+        run: |
+          git clone --depth 1 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/sforshee/wireless-regdb.git /tmp/regdb
+          cd /tmp/regdb
+          python3 - "$GITHUB_WORKSPACE/db-cn-6ghz.txt" <<'PY'
+          import re, sys, io
+          patch_file = sys.argv[1]
+          db = io.open("db.txt", encoding="utf-8").read()
+          patch = io.open(patch_file, encoding="utf-8").read()
+          m = re.search(r"^(country CN:.*?)(?=^country |\Z)", patch, re.S | re.M)
+          block = m.group(1).rstrip() + "\n\n"
+          db2, n = re.subn(r"^country CN:.*?(?=^country |\Z)", block, db, count=1, flags=re.S | re.M)
+          if n != 1:
+              sys.exit("未找到 country CN 段")
+          io.open("db.txt", "w", encoding="utf-8", newline="\n").write(db2)
+          print("CN 段已替换")
+          PY
+          python3 db2fw.py regulatory.db db.txt
+          mkdir -p "$GITHUB_WORKSPACE/openwrt/files/lib/firmware"
+          cp regulatory.db "$GITHUB_WORKSPACE/openwrt/files/lib/firmware/regulatory.db"
+          ls -l "$GITHUB_WORKSPACE/openwrt/files/lib/firmware/regulatory.db"
+
+      - name: 配置 feeds 与 target
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          cat >> .config <<'EOF'
+          CONFIG_TARGET_qualcommbe=y
+          CONFIG_TARGET_qualcommbe_ipq95xx=y
+          CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_nokia_beacon-10=y
+          CONFIG_TARGET_MULTI_PROFILE=n
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_luci-app-opkg=y
+          CONFIG_PACKAGE_wpad-openssl=y
+          CONFIG_PACKAGE_iw=y
+          CONFIG_PACKAGE_iwinfo=y
+          CONFIG_PACKAGE_tcpdump-mini=y
+          CONFIG_PACKAGE_htop=y
+          CONFIG_PACKAGE_nano=y
+          CONFIG_PACKAGE_openssh-sftp-server=y
+          CONFIG_PACKAGE_kmod-usb-storage=n
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          EOF
+
+          make defconfig
+          grep -E 'CONFIG_TARGET_qualcommbe_ipq95xx_DEVICE_nokia_beacon-10|CONFIG_PACKAGE_wpad' .config
+
+      - name: 下载源码包
+        run: |
+          cd openwrt
+          make -j$(nproc) download V=s || true
+
+      - name: 编译
+        run: |
+          cd openwrt
+          make -j$(nproc) V=s 2>&1 | tail -n 200
+
+      - name: 检查产物
+        run: |
+          cd openwrt
+          ls -lh bin/targets/qualcommbe/ipq95xx/ || true
+          test -f bin/targets/qualcommbe/ipq95xx/*sysupgrade.bin
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-beacon10-6ghz
+          path: |
+            openwrt/bin/targets/qualcommbe/ipq95xx/*.bin
+            openwrt/bin/targets/qualcommbe/ipq95xx/*.itb
+            openwrt/bin/targets/qualcommbe/ipq95xx/profiles.json
+          if-no-files-found: warn
