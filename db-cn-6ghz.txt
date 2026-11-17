@@ -1,0 +1,26 @@
+# wireless-regdb: 给 CN 加上 6 GHz 频段
+#
+# 用途：让 ath11k 在 CN 监管域下暴露 Band 4（5945–7125 MHz）的全部信道。
+# 注意：这只是"允许发射"，不代表合法。功率上限按 VLP/LPI 取保守值。
+#
+# 用法：把下面这段替换掉 openwrt/package/firmware/wireless-regdb/db.txt
+#       里原来的 `country CN:` 段，然后重新生成 regulatory.db。
+
+country CN: DFS-ETSI
+	(2400 - 2483.5 @ 40), (N/A, 20), (N/A)
+	(5150 - 5350 @ 80), (N/A, 20), (N/A), NO-OUTDOOR, AUTO-BW
+	(5725 - 5850 @ 80), (N/A, 27), (N/A), NO-OUTDOOR, AUTO-BW
+	# ── 以下为 6 GHz 强开段（UNII-5 ~ UNII-8）──
+	# 5945–6425：对应信道 1–93，含 PSC 5/21/37/53/69/85
+	(5945 - 6425 @ 160), (N/A, 23), (N/A), NO-OUTDOOR, AUTO-BW
+	# 6425–7125：对应信道 97–233
+	(6425 - 7125 @ 160), (N/A, 23), (N/A), NO-OUTDOOR, AUTO-BW
+
+# 说明：
+#   @ 160    —— 允许的最大带宽 160 MHz
+#   23 dBm   —— EIRP 上限，取 LPI（低功率室内）量级，避免直接冲到 SP 档
+#   NO-OUTDOOR —— 仅限室内
+#   AUTO-BW  —— 允许自动带宽降级
+#
+# 如果要更激进（LPI 上限 30 dBm EIRP），把 23 改成 30；
+# 但如果客户端/AP 的 BDF 功率表对不上，反而可能触发 DFS 或掉线，建议先用 23 测。
